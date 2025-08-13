@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bản đồ + Bảng tra cứu (Leaflet + Tabulator)</title>
+
+  <!-- Leaflet -->
+  <link href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" rel="stylesheet">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Tabulator -->
+  <link href="https://unpkg.com/tabulator-tables@5.6.2/dist/css/tabulator.min.css" rel="stylesheet">
+  <script src="https://unpkg.com/tabulator-tables@5.6.2/dist/js/tabulator.min.js"></script>
+
+  <!-- jQuery (phục vụ vài thao tác nhỏ) -->
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+
+  <style>
+    html, body {height:100%; margin:0; font-family:system-ui, Arial, sans-serif;}
+    .app {
+      display: grid;
+      grid-template-rows: auto 58% 42%;
+      height: 100%;
+    }
+    .toolbar{
+      display:flex; gap:12px; align-items:center; padding:10px 12px; border-bottom:1px solid #eee;
+    }
+    #map { width:100%; height:100%; }
+    #table { width:100%; height:100%; }
+    .btn{ padding:6px 10px; border:1px solid #ccc; border-radius:8px; cursor:pointer; }
+    .btn:active{ transform: translateY(1px); }
+    .search{ flex:1; padding:8px 10px; border:1px solid #ccc; border-radius:8px; }
+    .status { font-size:12px; color:#666; margin-left:auto; }
+    /* style highlight đối tượng đang chọn */
+    .feature-selected { outline: 3px solid #ff6600; }
+  </style>
+</head>
+<body>
+<div class="app">
+  <div class="toolbar">
+    <input id="q" class="search" placeholder="Tìm nhanh (gõ từ khóa, Enter để lọc)">
+    <button id="clear" class="btn">Xóa lọc</button>
+    <button id="download" class="btn">Tải CSV</button>
+    <span id="info" class="status"></span>
+  </div>
+
+  <div id="map"></div>
+  <div id="table"></div>
+</div>
+
+<script>
+(async function(){
+  // ==== 0) Cấu hình cơ bản ====
+  const DATA_URL = "data/forest.geojson";     // ĐƯỜNG DẪN GEOJSON
+  const ID_CANDIDATES = ["id", "fid", "ID", "FID", "OBJECTID", "OID"]; // các tên trường có thể dùng làm ID
+  const MAX_ZOOM_ON_SELECT = 18;
+
+  // ==== 1) Khởi tạo bản đồ ====
+  const map = L.map('map', {preferCanvas:true}).setView([11.0, 108.0], 6);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 20, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  // ==== 2) Nạp GeoJSON ====
+  const geojson = await fetch(DATA_URL).then(r => r.json());
+
+  // Tự phát hiện trường ID
+  const sampleProps = (geojson.features?.[0]?.properties) || {};
+  let ID_FIELD = ID_CANDIDATES.find(k => k in sampleProps);
+  if(!ID_FIELD){
+    ID_FIELD = "__rowid";
+    // gán ID chạy số khi không có trường ID rõ ràng
+    geojson.features.forEach((f, i) => { f.properties[ID_FIELD] = i + 1; });
+  }
+
+  // ==== 3) Tạo lớp đối tượng và chỉ mục để đồng bộ Map <-> Table ====
+  const layerIndex = new Map();    // id -> Leaflet layer
+
+  function styleDefault(f){
+    // style nhẹ cho polygon/line; point dùng marker mặc định
+    return { color: "#3388ff", weight: 1, fillColor: "#66a3ff", fillOpacity: 0.3 };
+  }
+
+  function onEachFeature(feature, layer){
+    const pid = feature.properties[ID_FIELD];
+
+    // popup tự động liệt kê các trường
+    const rows = Object.entries(feature.properties)
+      .map(([k,v]) => `<tr><th style="text-align:left;padding-right:8px;">${k}</th><td>${v ?? ""}</td></tr>`).join("");
+    layer.bindPopup(`<table>${rows}</table>`, { maxWidth: 360 });
+
+    // lưu chỉ mục
+    layerIndex.set(pid, layer);
+
+    // click trên bản đồ -> chọn hàng trong bảng
+    layer.on('click', () => selectRowById(pid, true));
+  }
+
+  // Tùy loại hình học để tạo marker cho điểm
+  function pointToLayer(feature, latlng){
+    return L.circleMarker(latlng, {radius:5, color:"#0078d7", weight:1, fillOpacity:0.7});
+  }
+
+  const geojsonLayer = L.geoJSON(geojson, { style: styleDefault, onEachFeature, pointToLayer }).addTo(map);
+  map.fitBounds(geojsonLayer.getBounds(), {padding:[20,20]});
+
+  // ==== 4) Chuẩn bị data cho bảng Tabulator ====
+  const dataRows = geojson.features.map(f => ({__geom: f.geometry, ...f.properties}));
+
+  // Tạo danh sách cột từ thuộc tính (ẩn cột __geom)
+  function buildColumns(props){
+    const cols = Object.keys(props).filter(k => k !== "__geom").map(k => ({
+      title: k, field: k, headerFilter: "input", sorter: "string"
+    }));
+    // đảm bảo cột ID nằm đầu tiên
+    const idColIdx = cols.findIndex(c => c.field === ID_FIELD);
+    if(idColIdx > 0){
+      const [idCol] = cols.splice(idColIdx, 1);
+      cols.unshift(idCol);
+    }
+    return cols;
+  }
+
+  const columns = buildColumns(dataRows[0] || {[ID_FIELD]: ""});
+
+  // ==== 5) Khởi tạo Tabulator (bảng tra cứu) ====
+  const table = new Tabulator("#table", {
+    data: dataRows,
+    columns,
+    layout: "fitDataFill",
+    height: "100%",
+    pagination: "local",
+    paginationSize: 20,
+    movableColumns: true,
+    selectable: 1,
+    placeholder: "Không có dữ liệu",
+    rowClick: (e, row) => {
+      const pid = row.getData()[ID_FIELD];
+      zoomToFeature(pid, true);
+    },
+    dataFiltered: function(filters, rows){
+      // Lọc trên bảng -> ẩn/hiện lớp trên bản đồ tương ứng
+      const allowed = new Set(rows.map(r => r.getData()[ID_FIELD]));
+      geojsonLayer.eachLayer(l => {
+        const pid = l.feature.properties[ID_FIELD];
+        if(allowed.size === 0 || allowed.has(pid)) {
+          if(!map.hasLayer(l)) map.addLayer(l);
+        } else {
+          if(map.hasLayer(l)) map.removeLayer(l);
+        }
+      });
+      $("#info").text(`Hiển thị: ${rows.length} / ${dataRows.length}`);
+    }
+  });
+
+  $("#info").text(`Hiển thị: ${dataRows.length} / ${dataRows.length}`);
+
+  // ==== 6) Tìm nhanh & tiện ích ====
+  $("#q").on("keypress", function(e){
+    if(e.which === 13){ // Enter
+      const term = $(this).val().toString().trim().toLowerCase();
+      if(!term){ table.clearFilter(true); return; }
+      table.setFilter(function(data){
+        // lọc toàn bảng: một ô chứa từ khóa là đậu
+        for(const [k, v] of Object.entries(data)){
+          if(k === "__geom") continue;
+          if((v ?? "").toString().toLowerCase().includes(term)) return true;
+        }
+        return false;
+      });
+    }
+  });
+
+  $("#clear").on("click", () => { $("#q").val(""); table.clearFilter(true); });
+  $("#download").on("click", () => table.download("csv", "bang_tracuu.csv"));
+
+  // ==== 7) Hàm đồng bộ chọn đối tượng/bản ghi ====
+  let lastSelected; // layer đang được highlight
+
+  function highlight(layer){
+    if(lastSelected && lastSelected.setStyle){
+      lastSelected.setStyle(styleDefault(lastSelected.feature));
+    }
+    if(layer.setStyle){
+      layer.setStyle({color:"#ff6600", weight:3, fillColor:"#ffb366", fillOpacity:0.5});
+    }
+    lastSelected = layer;
+  }
+
+  function zoomToFeature(pid, openPopup=false){
+    const layer = layerIndex.get(pid);
+    if(!layer) return;
+
+    if(layer.getBounds){ // polygon/line
+      map.fitBounds(layer.getBounds(), {maxZoom: MAX_ZOOM_ON_SELECT});
+    } else if(layer.getLatLng){ // point
+      map.setView(layer.getLatLng(), MAX_ZOOM_ON_SELECT);
+    }
+    highlight(layer);
+    if(openPopup) layer.openPopup();
+
+    // chọn hàng tương ứng trong bảng
+    table.deselectRow();
+    const row = table.searchRows(ID_FIELD, "=", pid)[0];
+    if(row){ row.select(); table.scrollToRow(row, "center", false); }
+  }
+
+  function selectRowById(pid, fromMap=false){
+    // gọi khi click trên map
+    const row = table.searchRows(ID_FIELD, "=", pid)[0];
+    if(row){
+      row.select();
+      table.scrollToRow(row, "center", false);
+      if(!fromMap) zoomToFeature(pid, true);
+    }
+  }
+
+})();
+</script>
+</body>
+</html>
